@@ -6,23 +6,20 @@ import matplotlib.patches as mpatches
 import matplotlib.animation as animation
 from matplotlib.widgets import Button
 import sys
+import os
 
 class GoGame:
     def __init__(self, size=9):
         self.size = size
-        self.board = [[0 for _ in range(size)] for _ in range(size)]  # 0: empty, 1: black, 2: white
-        self.captured_stones = []  # Store captured stones for visualization
-        self.move_history = []  # Track moves for undo functionality
-        self.current_player = 1  # 1: black, 2: white
-        self.subgraph_history = []  # Track subgraph formation history
-        
-        # Create graph representation
+        self.board = [[0 for _ in range(size)] for _ in range(size)] 
+        self.captured_stones = []  
+        self.move_history = [] 
+        self.current_player = 1  
+        self.subgraph_history = []  
         self.graph = nx.grid_2d_graph(size, size)
         
-        # Add diagonals for better connectivity representation
         for i in range(size):
             for j in range(size):
-                # Add diagonal connections
                 if i > 0 and j > 0:
                     self.graph.add_edge((i, j), (i-1, j-1))
                 if i > 0 and j < size - 1:
@@ -32,7 +29,6 @@ class GoGame:
                 if i < size - 1 and j < size - 1:
                     self.graph.add_edge((i, j), (i+1, j+1))
                     
-        # For dynamic visualization
         self.fig = None
         self.ax = None
         self.pos = None
@@ -44,7 +40,6 @@ class GoGame:
         self.group_edge_collections = []
     
     def get_neighbors(self, x, y):
-        """Get valid neighboring positions."""
         neighbors = []
         for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
             nx, ny = x + dx, y + dy
@@ -53,7 +48,6 @@ class GoGame:
         return neighbors
     
     def get_group(self, x, y):
-        """Get all stones in the same group as (x, y)."""
         if self.board[x][y] == 0:
             return set()
         
@@ -77,7 +71,6 @@ class GoGame:
         return group
     
     def get_liberties(self, group):
-        """Get the number of liberties for a group."""
         liberties = set()
         for x, y in group:
             for nx, ny in self.get_neighbors(x, y):
@@ -86,7 +79,6 @@ class GoGame:
         return liberties
     
     def is_valid_move(self, x, y, color=None):
-        """Check if a move is valid according to Go rules."""
         if color is None:
             color = self.current_player
             
@@ -119,7 +111,6 @@ class GoGame:
         return captured or self.get_liberties(placed_group)
     
     def capture_group(self, group):
-        """Remove a group of stones from the board."""
         for x, y in group:
             self.board[x][y] = 0
         self.captured_stones.extend(list(group))
@@ -153,7 +144,6 @@ class GoGame:
         return True
     
     def undo_move(self):
-        """Undo the last move."""
         if not self.move_history:
             return False
             
@@ -168,39 +158,32 @@ class GoGame:
         return True
     
     def _setup_visualization(self):
-        """Setup the visualization elements."""
         if self.fig is None:
             self.fig, self.ax = plt.subplots(figsize=(12, 10))
-            plt.subplots_adjust(bottom=0.2, right=0.8)  # Make space for buttons and legend
+            plt.subplots_adjust(bottom=0.2, right=0.8)
             
-            # Create position mapping for visualization
             self.pos = {(i, j): (j, -i) for i in range(self.size) for j in range(self.size)}
             
-            # Draw edges (board grid lines)
             self.edge_collection = nx.draw_networkx_edges(
                 self.graph, self.pos, edge_color='black', alpha=0.3, ax=self.ax
             )
             
-            # Setup node colors placeholder
             node_colors = ['lightblue'] * (self.size * self.size)
             self.node_collection = nx.draw_networkx_nodes(
                 self.graph, self.pos, node_color=node_colors,
                 node_size=500, edgecolors='black', linewidths=1, ax=self.ax
             )
             
-            # Add labels for coordinates
             labels = {(i, j): f"{i},{j}" for i in range(self.size) for j in range(self.size)}
             self.label_collection = nx.draw_networkx_labels(
                 self.graph, self.pos, labels, font_size=6, ax=self.ax
             )
             
-            # Create legend
             black_patch = mpatches.Patch(color='black', label='Black Stones')
             white_patch = mpatches.Patch(color='white', edgecolor='black', label='White Stones')
             empty_patch = mpatches.Patch(color='lightblue', label='Empty Intersections')
             self.legend_handles = [black_patch, white_patch, empty_patch]
             
-            # Add buttons
             ax_undo = plt.axes([0.1, 0.05, 0.1, 0.075])
             self.btn_undo = Button(ax_undo, 'Undo')
             self.btn_undo.on_clicked(self._on_undo_clicked)
@@ -217,8 +200,6 @@ class GoGame:
             self.fig.canvas.mpl_connect('button_press_event', self._on_click)
     
     def _update_visualization(self):
-        """Update the visualization with current board state."""
-        # Update node colors
         node_colors = []
         for i in range(self.size):
             for j in range(self.size):
@@ -288,7 +269,6 @@ class GoGame:
         self.fig.canvas.draw()
     
     def _get_all_groups(self):
-        """Get all groups of connected stones."""
         groups = []
         visited = set()
         
@@ -302,14 +282,11 @@ class GoGame:
         return groups
     
     def _on_click(self, event):
-        """Handle mouse click events."""
         if event.inaxes != self.ax:
             return
             
-        # Convert coordinates to board position
         x, y = int(round(-event.ydata)), int(round(event.xdata))
         
-        # Check if position is valid
         if 0 <= x < self.size and 0 <= y < self.size:
             success = self.play_move(x, y)
             if success:
@@ -318,12 +295,10 @@ class GoGame:
                 print(f"Invalid move at ({x}, {y})")
     
     def _on_undo_clicked(self, event):
-        """Handle undo button click."""
         if self.undo_move():
             self._update_visualization()
     
     def _on_reset_clicked(self, event):
-        """Handle reset button click."""
         self.board = [[0 for _ in range(self.size)] for _ in range(self.size)]
         self.captured_stones = []
         self.move_history = []
@@ -333,7 +308,6 @@ class GoGame:
         self._update_visualization()
     
     def _on_exit_clicked(self, event):
-        """Handle exit button click."""
         plt.close(self.fig)
         sys.exit(0)
     
@@ -422,7 +396,6 @@ class GoGame:
         plt.show()
 
 def demo():
-    # Create a 9x9 Go game
     game = GoGame(9)
     
     # Play some moves to demonstrate
@@ -431,35 +404,27 @@ def demo():
     game.play_move(5, 5)  # Black stone
     game.play_move(2, 2)  # White stone
     
-    # Visualize the board
     print("Go board after 4 moves:")
     game.visualize(save_as="go_board_after_4_moves.png")
     
-    # Play more moves to create a capture scenario
     game.play_move(3, 4)  # Black
     game.play_move(3, 5)  # White
     game.play_move(4, 5)  # Black
-    game.play_move(2, 4)  # White - this might capture the black stone at (3,4)
+    game.play_move(2, 4)  # White
     
-    # Print subgraph history
     game.print_subgraph_history()
     
-    # Visualize with captured stones highlighted
     print("\nGo board with captured stones highlighted:")
     game.visualize(highlight_captured=True, save_as="go_board_with_captured.png")
 
 def interactive_demo():
     game = GoGame(9)
     
-    # Add a button to print subgraph history
     def _on_history_clicked(event):
-        """Handle history button click."""
         game.print_subgraph_history()
     
-    # Setup visualization first to add the history button
     game._setup_visualization()
     
-    # Add history button
     ax_history = plt.axes([0.55, 0.05, 0.1, 0.075])
     btn_history = Button(ax_history, 'History')
     btn_history.on_clicked(_on_history_clicked)
