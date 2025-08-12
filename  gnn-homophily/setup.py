@@ -49,7 +49,6 @@ tf_dir.mkdir(parents=True, exist_ok=True)
 stub = tf_dir / "Ingram_trainer.py"
 if not stub.exists():
     stub.write_text(textwrap.dedent("""
-        \"\"\"Stub to satisfy historic public API; not implemented in this build.\"\"\"
         class Ingram_trainer:
             def __init__(self, *args, **kwargs):
                 raise NotImplementedError("Ingram_trainer is not available in this OpenHGNN build.")
