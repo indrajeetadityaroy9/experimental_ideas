@@ -1,6 +1,10 @@
-# Go Game Implementation
 
-- Implementation of Go rules including liberties and capture mechanics
-- Visualization of the game board and stone groups
-- Move history tracking
-- Subgraph formation history tracking
+### Requirements
+- Python 3.7+
+- PyTorch 1.9+
+- PyTorch Geometric 2.0+
+- NetworkX
+- Matplotlib
+- NumPy
+- optree 0.13+
+```
