@@ -1,4 +1,3 @@
-
 ### Requirements
 - Python 3.7+
 - PyTorch 1.9+
@@ -7,4 +6,3 @@
 - Matplotlib
 - NumPy
 - optree 0.13+
-```
