@@ -1,9 +1,13 @@
+import copy
+import math
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import Dataset, random_split
+from torch_geometric.data import Data, Batch
+from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import to_dense_adj, dense_to_sparse
 
@@ -28,16 +32,40 @@ def row_topk(adjacency_matrix, k):
     return result
 
 
-def board_one_hot(board_np):
+def board_one_hot(board_np, device=None):
     height, width = board_np.shape
-    black = torch.tensor((board_np == 1).astype(np.float32)).view(1, 1, height, width)
-    white = torch.tensor((board_np == 2).astype(np.float32)).view(1, 1, height, width)
-    empty = torch.tensor((board_np == 0).astype(np.float32)).view(1, 1, height, width)
+    kwargs = {'device': device} if device is not None else {}
+    black = torch.tensor((board_np == 1).astype(np.float32), **kwargs).view(1, 1, height, width)
+    white = torch.tensor((board_np == 2).astype(np.float32), **kwargs).view(1, 1, height, width)
+    empty = torch.tensor((board_np == 0).astype(np.float32), **kwargs).view(1, 1, height, width)
     return black, white, empty
 
 
 def _conv_hits(x, kernel):
     return F.conv2d(x, kernel, stride=1, padding=0)
+
+
+def board_node_features(board_np):
+    height, width = board_np.shape
+    black = (board_np == 1).astype(np.float32).reshape(-1, 1)
+    white = (board_np == 2).astype(np.float32).reshape(-1, 1)
+    empty = (board_np == 0).astype(np.float32).reshape(-1, 1)
+    rows = np.arange(height).repeat(width).astype(np.float32) / max(1., height - 1)
+    cols = np.tile(np.arange(width), height).astype(np.float32) / max(1., width - 1)
+    rc = np.stack([rows, cols], axis=1)
+    stacked = np.concatenate([black, white, empty, rc], axis=1)
+    return torch.from_numpy(stacked)
+
+
+class GoBoardGraphDataset(Dataset):
+    def __init__(self, graphs):
+        self.graphs = graphs
+
+    def __len__(self):
+        return len(self.graphs)
+
+    def __getitem__(self, idx):
+        return self.graphs[idx]
 
 
 def lattice_edge_index(height, width):
@@ -103,9 +131,6 @@ def motif_adjacency_from_hits(hits, height, width):
     return torch.maximum(adjacency, adjacency.t())
 
 
-
-
-
 class MotifConv2D(nn.Module):
 
     def __init__(self):
@@ -136,7 +161,8 @@ class MotifConv2D(nn.Module):
         if height < 3 or width < 3:
             return {}
 
-        black, white, empty = board_one_hot(board_np)
+        device = self.k_diag.device
+        black, white, empty = board_one_hot(board_np, device=device)
 
         def squeeze_bool(x):
             return x.to(torch.bool).squeeze(0).squeeze(0)
@@ -183,7 +209,31 @@ class MotifConv2D(nn.Module):
         return hits
 
 
+def board_to_data(board_np, target=None, motif_conv=None):
+    if motif_conv is None:
+        motif_conv = MotifConv2D()
 
+    height, width = board_np.shape
+    edge_index = lattice_edge_index(height, width)
+    node_features = board_node_features(board_np).float()
+
+    hits = motif_conv(board_np)
+    motif_adjacency = motif_adjacency_from_hits(hits, height, width)
+    motif_edge_index, motif_edge_weight = dense_to_sparse(motif_adjacency)
+
+    data = Data(
+        x=node_features,
+        edge_index=edge_index,
+        motif_edge_index=motif_edge_index,
+        motif_edge_weight=motif_edge_weight
+    )
+    data.num_nodes = height * width
+    board_tensor = torch.from_numpy(board_np.astype(np.int64))
+    data.board_state = board_tensor.view(-1)
+    data.board_size = torch.tensor([height, width], dtype=torch.long)
+    if target is not None:
+        data.y = torch.tensor([target], dtype=torch.float32)
+    return data
 
 
 class MotifSelectionPool(nn.Module):
@@ -255,7 +305,7 @@ class MotifClusteringPool(nn.Module):
 
         StS = S.t() @ S
         eye = torch.eye(self.clusters, device=S.device)
-        L_ortho = -torch.norm(StS - eye, p='fro') / (self.clusters ** 0.5)
+        L_ortho = torch.norm(StS - eye, p='fro') / (self.clusters ** 0.5)
 
         losses = {
             'cut': L_cut,
@@ -320,21 +370,56 @@ class MPoolModel(nn.Module):
             nn.Linear(hidden, 1)
         )
 
-    def forward(self, board_np):
+    def forward(self, data):
         device = self.initial_feature_map.weight.device
-        board_tensor = torch.from_numpy(board_np.astype(np.int64))
-        height, width = board_tensor.shape
-        if height != self.size or width != self.size:
-            raise ValueError(f'Expected board of size {self.size}x{self.size}, got {height}x{width}')
+        if isinstance(data, Batch):
+            graphs = data.to_data_list()
+        elif isinstance(data, Data):
+            graphs = [data]
+        elif isinstance(data, (list, tuple)):
+            graphs = list(data)
+        else:
+            raise TypeError('MPoolModel.forward expected a PyG Data, Batch, or list of Data objects.')
 
-        edge_index = lattice_edge_index(height, width).to(device)
-        adjacency = to_dense_adj(edge_index, max_num_nodes=height * width).squeeze(0).to(device)
+        predictions = []
+        reg_losses = []
+        diagnostics = []
 
-        motif_hits = self.mconv(board_np)
-        motif_adjacency = motif_adjacency_from_hits(motif_hits, height, width).to(device)
+        for graph in graphs:
+            pred, reg_loss, diag = self._forward_single_graph(graph, device)
+            predictions.append(pred)
+            reg_losses.append(reg_loss)
+            diagnostics.append(diag)
 
-        node_features = self._node_features(board_np).to(device)
-        x0 = self.initial_feature_map(node_features)
+        predictions = torch.stack(predictions, dim=0)
+        reg_losses = torch.stack(reg_losses, dim=0)
+        return predictions, reg_losses, diagnostics
+
+    def _forward_single_graph(self, graph, device):
+        graph = graph.to(device)
+        x = graph.x.float()
+        num_nodes = x.size(0)
+        if num_nodes == 0:
+            raise ValueError('Cannot run pooling on an empty graph')
+
+        edge_weight = getattr(graph, 'edge_weight', None)
+        adjacency = to_dense_adj(graph.edge_index, max_num_nodes=num_nodes, edge_attr=edge_weight).squeeze(0)
+        adjacency = adjacency.to(device=device, dtype=torch.float32)
+
+        if hasattr(graph, 'motif_edge_index'):
+            motif_weight = getattr(graph, 'motif_edge_weight', None)
+            motif_adjacency = to_dense_adj(
+                graph.motif_edge_index, max_num_nodes=num_nodes, edge_attr=motif_weight
+            ).squeeze(0).to(device=device, dtype=torch.float32)
+        else:
+            if not hasattr(graph, 'board_state') or not hasattr(graph, 'board_size'):
+                raise ValueError('Motif information missing. Provide motif_edge_index or board metadata.')
+            height, width = graph.board_size.tolist()
+            board_np = graph.board_state.view(height, width).detach().cpu().numpy()
+            motif_hits = self.mconv(board_np)
+            motif_adjacency = motif_adjacency_from_hits(motif_hits, height, width).to(device)
+
+        x0 = self.initial_feature_map(x)
 
         sel_x = x0
         sel_adj = adjacency
@@ -383,22 +468,9 @@ class MPoolModel(nn.Module):
         selection_stack = torch.cat(selection_readouts, dim=0)
         clustering_stack = torch.cat(clustering_readouts, dim=0)
         combined = torch.cat([selection_stack, clustering_stack], dim=0)
-        prediction = self.final_mlp(combined)
+        prediction = self.final_mlp(combined).squeeze()
 
         return prediction, total_reg_loss, diagnostics
-
-    @torch.no_grad()
-    def _node_features(self, board_np):
-        height, width = board_np.shape
-        black = (board_np == 1).astype(np.float32).reshape(-1, 1)
-        white = (board_np == 2).astype(np.float32).reshape(-1, 1)
-        empty = (board_np == 0).astype(np.float32).reshape(-1, 1)
-        rows = np.arange(height).repeat(width).astype(np.float32) / max(1., height - 1)
-        cols = np.tile(np.arange(width), height).astype(np.float32) / max(1., width - 1)
-        rc = np.stack([rows, cols], axis=1)
-        return torch.from_numpy(np.concatenate([black, white, empty, rc], axis=1))
-
-
 
 
 class MPoolExperiment:
@@ -409,6 +481,9 @@ class MPoolExperiment:
         self.current_player = 1
         self.pyg_diagnostics = None
         self.model = None
+        self.data_splits = {}
+        self.loaders = {}
+        self.training_history = []
 
     def get_group(self, board, x, y):
         color = board[x, y]
@@ -486,55 +561,166 @@ class MPoolExperiment:
         self.pyg_diagnostics = None
         return True
 
-    def train_model(self, num_epochs=50, lr=0.005, anneal_factor=0.95):
-        _ = anneal_factor  # retained for compatibility
-        torch.manual_seed(0)
-        np.random.seed(0)
+    def _board_target(self, board):
+        return float(np.sum(board == 1) - np.sum(board == 2))
+
+    def _gather_boards(self):
+        states = [board.copy() for _, board in self.move_history]
+        states.append(self.board.copy())
+        return states
+
+    def _build_dataset(self):
+        boards = self._gather_boards()
+        motif_conv = MotifConv2D()
+        graphs = [board_to_data(board, target=self._board_target(board), motif_conv=motif_conv)
+                  for board in boards]
+        return GoBoardGraphDataset(graphs)
+
+    def _split_lengths(self, total_samples):
+        train_len = max(1, int(math.floor(total_samples * 0.8)))
+        val_len = max(1, int(math.floor(total_samples * 0.1)))
+        remaining = total_samples - train_len - val_len
+        if remaining <= 0:
+            remaining = 1
+            if train_len > val_len:
+                train_len = max(1, train_len - 1)
+            else:
+                val_len = max(1, val_len - 1)
+        return train_len, val_len, remaining
+
+    def _evaluate_loader(self, loader, device):
+        self.model.eval()
+        total_task = 0.0
+        total_reg = 0.0
+        total_examples = 0
+
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(device)
+                pred, reg_loss, _ = self.model(batch)
+                pred = pred.view(-1)
+                targets = batch.y.to(device).view(-1)
+                task_loss = F.mse_loss(pred, targets, reduction='sum')
+                total_task += task_loss.item()
+                total_reg += reg_loss.sum().item()
+                total_examples += targets.numel()
+
+        if total_examples == 0:
+            return None
+
+        return {
+            'task': total_task / total_examples,
+            'reg': total_reg / total_examples,
+            'total': (total_task + total_reg) / total_examples
+        }
+
+    def train_model(self, num_epochs=100, batch_size=8, lr=0.005, patience=20, seed=0):
+        torch.manual_seed(seed)
+        np.random.seed(seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(0)
+            torch.cuda.manual_seed_all(seed)
+
+        dataset = self._build_dataset()
+        total_samples = len(dataset)
+        train_len, val_len, test_len = self._split_lengths(total_samples)
+
+        generator = torch.Generator().manual_seed(seed)
+        train_set, val_set, test_set = random_split(dataset, [train_len, val_len, test_len], generator=generator)
+
+        train_loader = DataLoader(train_set, batch_size=min(batch_size, train_len), shuffle=True)
+        val_loader = DataLoader(val_set, batch_size=min(batch_size, val_len), shuffle=False)
+        test_loader = DataLoader(test_set, batch_size=min(batch_size, test_len), shuffle=False)
+
+        self.data_splits = {'train': train_set, 'val': val_set, 'test': test_set}
+        self.loaders = {'train': train_loader, 'val': val_loader, 'test': test_loader}
 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model = MPoolModel(size=self.size).to(device)
 
         optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        target = float(np.sum(self.board == 1) - np.sum(self.board == 2))
+        best_state = copy.deepcopy(self.model.state_dict())
+        best_val = float('inf')
+        patience_counter = 0
+        self.training_history.clear()
 
-        print(f"Training for {num_epochs} epochs... Target: {target:.1f}")
+        print(f'Training for up to {num_epochs} epochs on {total_samples} samples '
+              f'(train/val/test = {train_len}/{val_len}/{test_len})')
 
         for epoch in range(num_epochs):
             self.model.train()
-            optimizer.zero_grad()
+            epoch_loss = 0.0
+            batches = 0
 
-            pred, reg_loss, _ = self.model(self.board)
-            task_loss = F.mse_loss(
-                pred.squeeze(),
-                torch.tensor(target, device=device, dtype=torch.float32)
-            )
-            total_loss = task_loss + reg_loss
-            total_loss.backward()
+            for batch in train_loader:
+                batch = batch.to(device)
+                optimizer.zero_grad()
+                pred, reg_loss, _ = self.model(batch)
+                pred = pred.view(-1)
+                targets = batch.y.to(device).view(-1)
+                task_loss = F.mse_loss(pred, targets)
+                reg_term = reg_loss.mean()
+                loss = task_loss + reg_term
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+                batches += 1
 
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            optimizer.step()
+            avg_train_loss = epoch_loss / max(1, batches)
+            val_metrics = self._evaluate_loader(val_loader, device)
+            val_total = val_metrics['total'] if val_metrics else float('inf')
+
+            self.training_history.append({
+                'epoch': epoch + 1,
+                'train_loss': avg_train_loss,
+                'val_total': val_total
+            })
 
             if (epoch + 1) % 10 == 0:
-                print(
-                    f"E {epoch + 1}: Loss={total_loss.item():.3f}(Task:{task_loss.item():.3f}, Reg:{reg_loss.item():.3f})")
+                print(f'E {epoch + 1}: Train={avg_train_loss:.3f}, Val={val_total:.3f}')
 
-        print("Training complete!")
+            if val_total < best_val:
+                best_val = val_total
+                patience_counter = 0
+                best_state = copy.deepcopy(self.model.state_dict())
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print('Early stopping triggered')
+                    break
 
-    def run_inference(self):
+        self.model.load_state_dict(best_state)
+        print('Training complete!')
+        return best_val
+
+    def run_inference(self, split='test', limit=None):
         if not self.model:
             raise RuntimeError('Model not trained. Call train_model first.')
+        if split not in self.loaders:
+            raise ValueError(f'Unknown split: {split}')
+
+        device = next(self.model.parameters()).device
+        loader = self.loaders[split]
+        results = []
 
         self.model.eval()
         with torch.no_grad():
-            _, _, diagnostics = self.model(self.board)
+            for batch in loader:
+                batch = batch.to(device)
+                pred, reg_loss, diagnostics = self.model(batch)
+                for idx in range(pred.size(0)):
+                    results.append({
+                        'prediction': pred[idx].item(),
+                        'reg_loss': reg_loss[idx].item(),
+                        'diagnostics': diagnostics[idx]
+                    })
+                    if limit is not None and len(results) >= limit:
+                        break
+                if limit is not None and len(results) >= limit:
+                    break
 
-        self.pyg_diagnostics = diagnostics
-        return diagnostics
-
-
-
+        self.pyg_diagnostics = results
+        return results
 
 def demo(num_epochs=200, board_setup=None):
     torch.manual_seed(0)
@@ -551,14 +737,12 @@ def demo(num_epochs=200, board_setup=None):
         experiment.play_move(row, col)
 
     experiment.train_model(num_epochs=num_epochs)
-    diagnostics = experiment.run_inference()
+    diagnostics = experiment.run_inference(split='test', limit=1)
 
-    for idx, diag in enumerate(diagnostics, start=1):
-        losses = diag['clustering']['losses']
-        print(
-            f"Layer {idx}: cut={losses['cut']:.4f}, ortho={losses['ortho']:.4f}"
-        )
-
+    if diagnostics:
+        for layer_idx, layer_diag in enumerate(diagnostics[0]['diagnostics'], start=1):
+            losses = layer_diag['clustering']['losses']
+            print(f"Layer {layer_idx}: cut={losses['cut']:.4f}, ortho={losses['ortho']:.4f}")
     return diagnostics
 
 
