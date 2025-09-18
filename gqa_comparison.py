@@ -58,6 +58,11 @@ class BenchmarkConfig:
         self.compile_model = compile_model
         self.show_grad_demo = show_grad_demo
 
+        if self.num_kv_heads == 0 or self.num_query_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                "num_query_heads must be divisible by num_kv_heads and num_kv_heads must be non-zero"
+            )
+
 
 class BenchmarkResult:
     def __init__(self, backend, device, avg_forward_ms, tokens_per_second, total_params_m, extra=None):
@@ -160,14 +165,12 @@ if torch is not None:
 
             attn_mask = None
             if self.use_banded:
-                attn_mask = torch.full(
-                    (x.size(1), x.size(1)),
-                    float("-inf"),
-                    device=x.device,
-                )
-                for i in range(x.size(1)):
-                    start = max(0, i - self.window_size + 1)
-                    attn_mask[i, start : i + 1] = 0.0
+                seq_len = x.size(1)
+                positions = torch.arange(seq_len, device=x.device)
+                delta = positions[:, None] - positions[None, :]
+                allowed = (delta >= 0) & (delta < self.window_size)
+                attn_mask = torch.full((seq_len, seq_len), float("-inf"), device=x.device)
+                attn_mask = attn_mask.masked_fill(allowed, 0.0)
 
             attn_output = F.scaled_dot_product_attention(
                 q,
@@ -328,7 +331,8 @@ if jax is not None:
             self.v_proj = fnn.Dense(self.num_kv_heads * self.head_dim, use_bias=False)
             self.out_proj = fnn.Dense(self.embed_dim, use_bias=False)
             self.rope = JaxRotaryEmbedding(dim=self.head_dim)
-            self.dropout = fnn.Dropout(self.dropout_rate)
+            self.attn_dropout = fnn.Dropout(self.dropout_rate)
+            self.out_dropout = fnn.Dropout(self.dropout_rate)
 
         def __call__(self, x, deterministic):
             batch_size, seq_len, _ = x.shape
@@ -343,18 +347,17 @@ if jax is not None:
             v = jnp.repeat(v, self.num_query_groups, axis=1)
 
             attn_weights = jnp.matmul(q, jnp.swapaxes(k, -1, -2)) * self.scale
+            delta = positions[:, None] - positions[None, :]
             if self.use_banded:
-                band = jnp.tril(jnp.ones((seq_len, seq_len)))
-                for i in range(seq_len):
-                    start = max(0, i - self.window_size + 1)
-                    band = band.at[i, :start].set(0.0)
+                allowed = (delta >= 0) & (delta < self.window_size)
             else:
-                band = jnp.tril(jnp.ones((seq_len, seq_len)))
-            attn_weights = jnp.where(band[None, None, :, :] == 1.0, attn_weights, -1e9)
+                allowed = delta >= 0
+            attn_weights = jnp.where(allowed[None, None, :, :], attn_weights, -1e9)
             attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-            attn_weights = self.dropout(attn_weights, deterministic=deterministic)
+            attn_weights = self.attn_dropout(attn_weights, deterministic=deterministic)
             out = jnp.matmul(attn_weights, v).transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.embed_dim)
-            return self.out_proj(out)
+            out = self.out_proj(out)
+            return self.out_dropout(out, deterministic=deterministic)
 
 
     class JaxTransformerBlock(fnn.Module):
@@ -379,20 +382,21 @@ if jax is not None:
             )
             self.norm1 = fnn.LayerNorm()
             self.norm2 = fnn.LayerNorm()
-            self.ffn = fnn.Sequential(
-                [
-                    fnn.Dense(4 * self.embed_dim),
-                    fnn.gelu,
-                    fnn.Dense(self.embed_dim),
-                    fnn.Dropout(self.dropout_rate),
-                ]
-            )
+            self.ffn_dense1 = fnn.Dense(4 * self.embed_dim)
+            self.ffn_dense2 = fnn.Dense(self.embed_dim)
+            self.ffn_dropout = fnn.Dropout(self.dropout_rate)
 
         def __call__(self, x, deterministic):
             residual = x
             x = self.norm1(x)
-            x = residual + self.attention(x, deterministic)
-            x = x + self.ffn(self.norm2(x), deterministic=deterministic)
+            attn_out = self.attention(x, deterministic)
+            x = residual + attn_out
+            ffn_input = self.norm2(x)
+            ffn_hidden = self.ffn_dense1(ffn_input)
+            ffn_hidden = fnn.gelu(ffn_hidden)
+            ffn_hidden = self.ffn_dense2(ffn_hidden)
+            ffn_hidden = self.ffn_dropout(ffn_hidden, deterministic=deterministic)
+            x = x + ffn_hidden
             return x
 
 
