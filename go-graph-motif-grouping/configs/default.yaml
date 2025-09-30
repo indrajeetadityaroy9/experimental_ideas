@@ -1,0 +1,68 @@
+experiment:
+  name: "default"
+  seed: 42
+  device: "cuda"  # cuda or cpu
+  output_dir: "outputs"
+  checkpoint_dir: "checkpoints"
+
+model:
+  name: "MPoolModel"
+  board_size: 9
+  in_dim: 5  # [is_black, is_white, is_empty, normalized_row, normalized_col]
+  hidden_dim: 64
+  num_layers: 2
+  pool_ratios: [0.5, 0.5]
+  cluster_ratios: [0.5, 0.5]
+  lambda_cut: 1.0
+  lambda_ortho: 1.0
+
+data:
+  dataset_type: "hybrid"  # tactical, game_sequence, or hybrid
+  num_tactical: 60
+  num_game: 40
+  complexity: "medium"  # low, medium, high
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+
+training:
+  max_epochs: 150
+  patience: 25
+  grad_clip: 1.0
+  log_interval: 10
+  save_interval: 10
+  val_interval: 1
+  resume: null  # Path to checkpoint to resume from
+
+optimizer:
+  name: "adam"
+  lr: 0.001
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: "reduce_on_plateau"
+  mode: "min"
+  factor: 0.5
+  patience: 10
+  min_lr: 1.0e-6
+  verbose: true
+
+logging:
+  use_wandb: false
+  wandb_project: "go-motif-pooling"
+  wandb_entity: null
+  use_tensorboard: true
+  log_metrics: ["loss", "task_loss", "reg_loss", "mse", "mae", "r2"]
+  log_gradients: false
+  log_parameters: false
+
+evaluation:
+  metrics: ["mse", "mae", "rmse", "r2"]
+  save_predictions: true
+  visualize: true

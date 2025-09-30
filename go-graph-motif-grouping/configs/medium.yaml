@@ -1,0 +1,22 @@
+experiment:
+  name: "medium_13x13"
+
+model:
+  board_size: 13
+  hidden_dim: 128
+  num_layers: 3
+  pool_ratios: [0.6, 0.5, 0.4]
+  cluster_ratios: [0.6, 0.5, 0.4]
+
+data:
+  num_tactical: 100
+  num_game: 60
+  batch_size: 12
+  complexity: "high"
+
+training:
+  max_epochs: 200
+  patience: 30
+
+optimizer:
+  lr: 0.0005

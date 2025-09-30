@@ -1,0 +1,22 @@
+experiment:
+  name: "large_19x19"
+
+model:
+  board_size: 19
+  hidden_dim: 256
+  num_layers: 4
+  pool_ratios: [0.7, 0.6, 0.5, 0.4]
+  cluster_ratios: [0.7, 0.6, 0.5, 0.4]
+
+data:
+  num_tactical: 150
+  num_game: 100
+  batch_size: 8
+  complexity: "high"
+
+training:
+  max_epochs: 250
+  patience: 35
+
+optimizer:
+  lr: 0.0003

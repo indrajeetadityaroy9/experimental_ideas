@@ -1,0 +1,21 @@
+experiment:
+  name: "small_9x9"
+
+model:
+  board_size: 9
+  hidden_dim: 64
+  num_layers: 2
+  pool_ratios: [0.5, 0.5]
+  cluster_ratios: [0.5, 0.5]
+
+data:
+  num_tactical: 60
+  num_game: 40
+  batch_size: 16
+
+training:
+  max_epochs: 150
+  patience: 25
+
+optimizer:
+  lr: 0.001
